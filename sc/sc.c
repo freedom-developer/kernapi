@@ -1,8 +1,17 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kallsyms.h>
-#include <asm-generic/unistd.h>
 #include <asm/pgtable.h>
+#include <linux/proc_fs.h>
+#include <linux/sched.h>
+#include <linux/mm_types.h>
+#include <linux/mm.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
+
+#ifndef __NR_syscalls
+#define __NR_syscalls (332 + 1)
+#endif
 
 
 MODULE_LICENSE("GPL");
@@ -10,6 +19,7 @@ MODULE_LICENSE("GPL");
 static int my_sys_call_nr;
 static unsigned long *sys_call_table;
 static unsigned long sys_ni_syscall;
+static struct proc_dir_entry *my_sys_call_nr_proc;
 
 
 static int find_sys_call_table(void)
@@ -84,7 +94,7 @@ static int find_sys_call_nr(int start)
 static int sys_call_table_wr_mk_protect(int mk)
 {
     int level;
-    pte_t *pte;
+    pte_t *pte, v;
 
     if (!sys_call_table) {
         printk(KERN_ERR "sys_call_table not find\n");
@@ -96,11 +106,20 @@ static int sys_call_table_wr_mk_protect(int mk)
         printk(KERN_ERR "lookup_address sys_call_table failed\n");
         return -1;
     }
+    v.pte = pte->pte;
+
+    // if (level == PG_LEVEL_4K) {
+    //     printk(KERN_INFO "leve is PG_LEVEL_4K\n");
+    // } else {
+    //     printk(KERN_INFO "level is %d\n", level);
+    // }
 
     if (mk)
-        pte_mkwrite(*pte);
+        v = pte_mkwrite(v);
     else
-        pte_wrprotect(*pte);
+        v = pte_wrprotect(v);
+    
+    pte->pte = v.pte;
     
     return 0;
 }
@@ -131,8 +150,55 @@ static int set_sys_call(int nr, unsigned long sys_call_func)
     return sys_call_table_wrprotect();
 }
 
+#define BUFLEN 100
+static long pr_hello(unsigned long __user *addr)
+{
+    // 为进程申请一块内存，并初始化为hello world!
+    struct mm_struct *mm = current->active_mm;
+    unsigned long oldbrk = mm->brk;
 
+    printk(KERN_INFO "begin to call vm_brk to incease my brk\n");
 
+    // down_write(&mm->mmap_sem);
+    if (vm_brk(oldbrk, BUFLEN) != 0) {
+        // up_write(&mm->mmap_sem);
+        printk(KERN_ERR "brk failed\n");
+        return -1;
+    }
+    mm->brk += BUFLEN;
+    // up_write(&mm->mmap_sem);
+    // snprintf((char *)oldbrk, BUFLEN, "hello world!\n");
+    char msg[] = "hello world!";
+    if (copy_to_user((void *)oldbrk, (void *)msg, sizeof(msg))) {
+        printk(KERN_ERR "copy message into oldbrk failed\n");
+        return -1;
+    }
+
+    if (copy_to_user(addr, &oldbrk, sizeof(unsigned long))) {
+        printk(KERN_ERR "copy address to user program failed\n");
+        return -1;
+    }
+    
+    printk(KERN_INFO "call vm_brk success, and return it's old brk %ld\n", oldbrk);
+
+    return 0;
+}
+
+int sc_nr_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "%d", my_sys_call_nr);
+    return 0;
+}
+
+static int sc_nr_open(struct inode *inode, struct file *filp)
+{
+    return single_open(filp, sc_nr_show, NULL);
+}
+
+struct file_operations sc_open = {
+    .open = sc_nr_open,
+    .read = seq_read,
+};
 
 static int __init sc_init(void)
 {
@@ -153,11 +219,28 @@ static int __init sc_init(void)
         return -1;
     }
 
+    if (set_sys_call(my_sys_call_nr, (unsigned long)pr_hello) < 0) {
+        return -1;
+    }
+
+    pr_sys_call_table();
+
+    my_sys_call_nr_proc = proc_create("my_sys_call_nr", 0, NULL, &sc_open);
+    if (!my_sys_call_nr_proc) {
+        set_sys_call(my_sys_call_nr, sys_ni_syscall);
+        printk(KERN_ERR "Create /proc/my_sys_call_nr failed\n");
+        return -1;
+    }
+    
+    printk(KERN_INFO "sc module initialize OK!\n");
+
     return 0;
 }
 
 static void __exit sc_exit(void)
 {
+    set_sys_call(my_sys_call_nr, sys_ni_syscall);
+    remove_proc_entry("my_sys_call_nr", NULL);
     printk(KERN_WARNING"sc module exit ok!\n");
 }
 
